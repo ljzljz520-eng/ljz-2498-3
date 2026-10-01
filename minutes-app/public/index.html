@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>会议纪要编辑器</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app" v-cloak>
+  <header class="topbar">
+    <h1>会议纪要编辑器</h1>
+    <div class="author">
+      <label>操作人 <input v-model="author" placeholder="你的名字" @change="saveAuthor"></label>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- 会议列表 -->
+    <aside class="sidebar">
+      <div class="side-head">
+        <h2>会议</h2>
+        <button @click="newMeeting">＋ 新建</button>
+      </div>
+      <ul class="meeting-list">
+        <li v-for="m in meetings" :key="m.id" :class="{active: m.id===currentId}" @click="selectMeeting(m.id)">
+          <span class="m-title">{{ m.title }}</span>
+          <span class="pill" :class="m.status==='finalized' ? 'pill-final' : 'pill-draft'">
+            {{ m.status==='finalized' ? '已定稿' : '草稿' }}
+          </span>
+        </li>
+      </ul>
+    </aside>
+
+    <!-- 主编辑区 -->
+    <main v-if="state" class="editor">
+      <div v-if="error" class="banner banner-error" @click="error=null">{{ error }} ✕</div>
+      <div v-if="notice" class="banner banner-ok" @click="notice=null">{{ notice }} ✕</div>
+      <div v-if="conflict" class="banner banner-conflict">
+        保存冲突：内容已被他人更新到第 {{ conflict.current_version_no }} 版（离线并行修改）。
+        <button @click="reloadLatest">放弃本地并载入最新</button>
+        <button @click="forceSave">以我的内容为准覆盖保存</button>
+      </div>
+
+      <!-- 会议头：区分“会议已定稿”与“待办已建立”两种状态 -->
+      <section class="meeting-head card">
+        <div class="row">
+          <input class="title-input" v-model="meetingTitle" :disabled="finalized" @change="renameMeeting" placeholder="会议标题">
+          <span class="pill big" :class="finalized ? 'pill-final' : 'pill-draft'">
+            会议：{{ finalized ? '已定稿（第 '+finalizedVersionNo+' 版）' : '草稿' }}
+          </span>
+          <span class="pill big pill-task">待办：{{ establishedCount }}/{{ todoBlockCount }} 块已建立，{{ state.tasks.length }} 项任务</span>
+          <span v-if="state.pending_jobs>0" class="pill big pill-warn">有 {{ state.pending_jobs }} 个待恢复作业</span>
+        </div>
+        <div class="row actions">
+          <template v-if="!finalized">
+            <button class="primary" @click="save()" :disabled="saving">{{ saving ? '保存中…' : '保存（第 '+(baseVersionNo+1)+' 版）' }}</button>
+            <button class="danger" @click="finalize">定稿</button>
+          </template>
+          <template v-else>
+            <a class="btn" :href="'/api/meetings/'+currentId+'/export'" target="_blank">导出正式纪要（定稿版）</a>
+            <select v-model="exportVersionNo" @change="openExport">
+              <option :value="null">导出历史版本…</option>
+              <option v-for="v in state.versions" :key="v.version_no" :value="v.version_no">
+                第 {{ v.version_no }} 版（{{ v.kind==='finalize'?'定稿':'编辑' }}，{{ v.created_at }}）
+              </option>
+            </select>
+          </template>
+          <span class="muted">当前基于第 {{ baseVersionNo }} 版编辑</span>
+        </div>
+        <div v-if="finalizeInfo" class="finalize-info">
+          <strong>定稿结果：</strong>第 {{ finalizeInfo.version_no }} 版；
+          快照{{ finalizeInfo.snapshot_complete ? '已生成' : '未完成（可恢复）' }}
+          <ul v-if="finalizeInfo.warnings && finalizeInfo.warnings.length">
+            <li v-for="w in finalizeInfo.warnings" :key="w.message" class="warn">⚠ {{ w.message }}</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 议题 -->
+      <section class="card">
+        <h2>议题</h2>
+        <div v-for="(a,i) in agenda" :key="a.id" class="agenda-row">
+          <span class="idx">{{ i+1 }}.</span>
+          <input v-model="a.title" :disabled="finalized" placeholder="议题标题">
+          <button v-if="!finalized" @click="agenda.splice(i,1)">删除</button>
+        </div>
+        <button v-if="!finalized" @click="agenda.push({id: uuid(), title: ''})">＋ 添加议题</button>
+      </section>
+
+      <!-- 正文块 -->
+      <section class="card">
+        <h2>正文</h2>
+        <div v-for="(b,i) in blocks" :key="b.id" class="block" :class="'block-'+b.type">
+          <div class="block-bar">
+            <span class="tag">{{ {paragraph:'段落', resolution:'决议', todo:'待办'}[b.type] }}</span>
+            <template v-if="b.type==='todo'">
+              <span class="pill" :class="taskOf(b) ? 'pill-task' : 'pill-draft'">
+                {{ taskOf(b) ? '已建立 '+taskOf(b).code : '未建立（保存后创建任务）' }}
+              </span>
+              <template v-if="taskOf(b)">
+                <span class="pill" :class="taskOf(b).acked ? 'pill-final' : 'pill-warn'">
+                  {{ taskOf(b).owner ? (taskOf(b).acked ? '已签收' : '未签收') : '无负责人' }}
+                </span>
+                <span class="pill pill-status">{{ statusLabel(taskOf(b).status) }}</span>
+                <span v-if="taskOf(b).overdue" class="pill pill-overdue">已逾期</span>
+              </template>
+            </template>
+            <template v-if="b.type==='resolution' && resolutionOf(b)">
+              <span class="pill" :class="resolutionOf(b).status==='withdrawn' ? 'pill-overdue' : 'pill-final'">
+                {{ resolutionOf(b).code }} {{ resolutionOf(b).status==='withdrawn' ? '已撤回' : '生效中' }}
+              </span>
+            </template>
+            <span class="spacer"></span>
+            <button v-if="!finalized && b.type==='todo'" @click="duplicateTodoRef(i)" title="在正文另一处引用同一任务">⧉ 再次引用</button>
+            <button v-if="!finalized" @click="removeBlock(i)" title="删除段落不会取消已建立的待办">🗑 删除</button>
+          </div>
+
+          <textarea v-if="b.type==='paragraph'" v-model="b.text" :disabled="finalized" placeholder="段落文字"></textarea>
+
+          <div v-if="b.type==='resolution'" class="resolution-edit">
+            <input v-model="b.text" :disabled="finalized" placeholder="决议内容">
+            <button v-if="resolutionOf(b) && resolutionOf(b).status==='active'" @click="withdraw(resolutionOf(b))">撤回决议</button>
+          </div>
+
+          <div v-if="b.type==='todo'" class="todo-edit">
+            <input v-model="b.title" :disabled="finalized" placeholder="待办事项标题" class="todo-title">
+            <div class="todo-fields">
+              <label>负责人 <input v-model="b.owner" :disabled="finalized" placeholder="可留空"></label>
+              <label>截止类型
+                <select v-model="b.due_kind" :disabled="finalized">
+                  <option value="none">无</option><option value="date">仅日期</option><option value="datetime">具体时刻</option>
+                </select>
+              </label>
+              <label v-if="b.due_kind==='date'">日期 <input type="date" v-model="b.due_date" :disabled="finalized"></label>
+              <label v-if="b.due_kind==='datetime'">时刻 <input type="datetime-local" v-model="b.due_at_local" :disabled="finalized"></label>
+              <label v-if="b.due_kind!=='none'">时区
+                <select v-model="b.due_tz" :disabled="finalized">
+                  <option v-for="tz in tzOptions" :key="tz" :value="tz">{{ tz }}</option>
+                </select>
+              </label>
+              <label>关联决议
+                <select v-model="b.resolution_token" :disabled="finalized">
+                  <option :value="null">（无）</option>
+                  <option v-for="r in state.resolutions" :key="r.client_token" :value="r.client_token" :disabled="r.status==='withdrawn'">
+                    {{ r.code }} {{ r.text.slice(0,20) }}{{ r.status==='withdrawn' ? '（已撤回）' : '' }}
+                  </option>
+                </select>
+              </label>
+            </div>
+            <div v-if="taskOf(b)" class="due-hint">任务实体：{{ taskOf(b).code }} ｜ 截止：{{ taskOf(b).due_label }} ｜ 正文引用 {{ taskOf(b).mention_count }} 处</div>
+          </div>
+        </div>
+        <div v-if="!finalized" class="add-block">
+          <button @click="addBlock('paragraph')">＋ 段落</button>
+          <button @click="addBlock('resolution')">＋ 决议</button>
+          <button @click="addBlock('todo')">＋ 待办</button>
+        </div>
+      </section>
+
+      <!-- 待办汇总表（与正文待办来自同一任务实体） -->
+      <section class="card">
+        <h2>待办汇总表 <span class="muted small">（与正文待办同一任务实体；删段落不会取消任务）</span></h2>
+        <table class="summary">
+          <thead><tr><th>编号</th><th>事项</th><th>负责人</th><th>签收</th><th>截止</th><th>状态</th><th>决议</th><th>正文引用</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="t in state.tasks" :key="t.id" :class="{cancelled: t.status==='cancelled'}">
+              <td>{{ t.code }}</td>
+              <td>{{ t.title }}</td>
+              <td>
+                <span v-if="t.owner">{{ t.owner }}</span><span v-else class="missing">未指派</span>
+                <button v-if="finalized" @click="openReassign(t)">变更</button>
+              </td>
+              <td>{{ t.owner ? (t.acked ? '已签收' : '未签收') : '—' }}
+                <button v-if="t.owner && !t.acked" @click="ack(t)">签收</button>
+              </td>
+              <td>{{ t.due_label }} <span v-if="t.overdue" class="pill pill-overdue">逾期</span></td>
+              <td>
+                <select :value="t.status" @change="setStatus(t, $event.target.value)">
+                  <option value="open">进行中</option><option value="done">已完成</option><option value="cancelled">已取消</option>
+                </select>
+              </td>
+              <td>
+                <template v-if="t.resolution">{{ t.resolution.code }}<span v-if="t.resolution.status==='withdrawn'" class="missing">（已撤回）</span></template>
+                <template v-else>—</template>
+              </td>
+              <td>{{ t.mention_count }}</td>
+              <td><button @click="toggleHistory(t)">沿革</button></td>
+            </tr>
+            <tr v-if="!state.tasks.length"><td colspan="9" class="muted">暂无待办</td></tr>
+          </tbody>
+        </table>
+
+        <!-- 负责人沿革 -->
+        <div v-for="t in state.tasks" :key="'h-'+t.id">
+          <div v-if="histories[t.id]" class="history">
+            <h3>{{ t.code }} 负责人沿革</h3>
+            <table>
+              <thead><tr><th>#</th><th>负责人</th><th>类型</th><th>生效</th><th>失效</th><th>变更单</th><th>原因</th><th>签收</th></tr></thead>
+              <tbody>
+                <tr v-for="a in histories[t.id].assignments" :key="a.id" :class="{current: !a.effective_to}">
+                  <td>{{ a.seq }}</td><td>{{ a.owner_name }}</td>
+                  <td>{{ {initial:'初始', reassign:'改派', post_finalize:'定稿后变更'}[a.change_type] }}</td>
+                  <td>{{ a.effective_from }}</td><td>{{ a.effective_to || '（现任）' }}</td>
+                  <td>{{ a.ticket || '—' }}</td><td>{{ a.reason || '—' }}</td>
+                  <td>{{ a.ack ? a.ack.acked_by+' @ '+a.ack.acked_at : '未签收' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 定稿后独立变更弹层 -->
+      <div v-if="reassignTask" class="modal">
+        <div class="modal-body">
+          <h3>变更负责人：{{ reassignTask.code }}（会议已定稿，需独立变更）</h3>
+          <p class="muted">旧签收记录绑定旧分派，不会视为确认新分派；新负责人需重新签收。</p>
+          <label>新负责人 <input v-model="reassignForm.owner_name"></label>
+          <label>变更单号 <input v-model="reassignForm.ticket" placeholder="必填，如 CHG-2026-001"></label>
+          <label>原因 <input v-model="reassignForm.reason"></label>
+          <div class="row">
+            <button class="primary" @click="submitReassign">提交变更</button>
+            <button @click="reassignTask=null">取消</button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <main v-else class="editor empty">
+      <p>请选择或新建一个会议。</p>
+    </main>
+  </div>
+</div>
+<script src="/vendor/vue.global.prod.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
