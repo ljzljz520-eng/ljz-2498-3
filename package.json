@@ -1,0 +1,15 @@
+{
+  "name": "meeting-minutes-editor",
+  "version": "1.0.0",
+  "main": "server/src/server.js",
+  "scripts": {
+    "start": "node server/src/server.js",
+    "test": "node --test test/"
+  },
+  "description": "会议纪要编辑器：统一任务实体、负责人沿革、截止时点时区语义、定稿快照与断点续跑渲染",
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^5.2.1",
+    "vue": "^3.5.43"
+  }
+}
